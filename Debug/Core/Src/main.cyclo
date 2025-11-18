@@ -1,0 +1,9 @@
+../Core/Src/main.c:92:5:__io_putchar	1
+C:\Users\Lenovo\Documents\New folder\STM32CubeIDE_1.17.0\STM32CubeIDE\plugins\com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.12.3.rel1.win32_1.1.0.202410251130\tools\arm-none-eabi\include\stdio.h:220:5:fputc	1
+../Core/Src/main.c:100:5:main	39
+../Core/Src/main.c:362:13:FFT_Compute	5
+../Core/Src/main.c:401:13:MX_GPIO_Init	1
+../Core/Src/main.c:422:13:MX_ADC1_Init	3
+../Core/Src/main.c:449:13:MX_USART2_UART_Init	2
+../Core/Src/main.c:476:6:SystemClock_Config	3
+../Core/Src/main.c:502:6:Error_Handler	1
