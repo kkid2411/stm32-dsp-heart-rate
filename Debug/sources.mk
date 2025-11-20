@@ -24,5 +24,6 @@ C_DEPS :=
 SUBDIRS := \
 Core/Src \
 Core/Startup \
-Drivers/STM32F4xx_HAL_Driver/Src \
+Drivers/CMSIS/STM32F4xx_HAL_Driver/Src \
+Drivers/Device/ST/STM32F4xx/Source/Templates/iar \
 

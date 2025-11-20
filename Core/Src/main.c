@@ -6,7 +6,7 @@
  *  - Phát hiện đỉnh (peak) bằng ngưỡng Schmitt động + state machine.
  *  - Từ khoảng RR (Beat-to-Beat) -> tính BPM trong miền thời gian.
  *  - Thu thập 1024 mẫu đã xử lý để tính DFT (FFT thủ công) -> tìm đỉnh phổ.
- *  - In dữ liệu dạng "key:value" để hiển thị trên Serial Plotter (Arduino IDE).
+ *  - In dữ liệu dạng text để hiển thị trên Serial Monitor.
  *  - LED PA5 nháy mỗi khi phát hiện một nhịp tim hợp lệ.
  *
  *  Lưu ý: file nên lưu ở dạng UTF-8 (không BOM) để hiển thị tiếng Việt qua UART.
@@ -86,7 +86,11 @@ static float fft_mag[FFT_N/2];   /* biên độ phổ |X(k)| */
 static uint32_t fft_index = 0;   /* con trỏ ghi mẫu vào fft_in */
 static bool     fft_ready = false; /* true khi đủ 1024 mẫu để tính DFT */
 
-static void FFT_Compute(void);   /* prototype hàm tính DFT và in kết quả */
+/* GIÁ TRỊ FFT DÙNG ĐỂ IN ĐỊNH KỲ (2 lần/giây) */
+static float g_fft_peak_freq = 0.0f;  /* Hz */
+static float g_fft_bpm       = 0.0f;  /* BPM từ FFT */
+
+static void FFT_Compute(void);   /* prototype hàm tính DFT và cập nhật kết quả */
 
 /* --------- Redirect printf về UART2 (dùng cho debug + Serial Plotter) ----- */
 int __io_putchar(int ch) {
@@ -111,13 +115,7 @@ int main(void)
   /* Bắt đầu chuyển đổi ADC ở chế độ liên tục */
   if (HAL_ADC_Start(&hadc1) != HAL_OK) Error_Handler();
 
-  /* ================= FIFO cho cửa sổ min/max ~1 s =================
-   * BUF_CAP = số mẫu trong 1 s ở Fs=PROCESS_FS_HZ (~100) + một chút dư.
-   * buf      : lưu tín hiệu đã offset (sig_u) để tính min/max trượt.
-   * head     : vị trí ghi tiếp theo trong buffer (vòng tròn).
-   * count    : số mẫu hiện có trong buffer (chưa đầy thì < BUF_CAP).
-   * win_min/max: min/max đang theo dõi trong cửa sổ 1 s.
-   * =================================================================*/
+  /* ================= FIFO cho cửa sổ min/max ~1 s ================= */
   enum { BUF_CAP = (WIN_MS * PROCESS_FS_HZ) / 1000u + 4u }; /* ≈104 */
   uint16_t buf[BUF_CAP]; memset(buf, 0, sizeof(buf));
   uint16_t head = 0, count = 0;
@@ -126,51 +124,24 @@ int main(void)
   /* Biến tạm đọc ADC */
   uint32_t raw = 0;
 
-  /* ================= Khử DC bằng trung bình trượt 1 giây ==========
-   * ma_sum : tổng các phần tử trong buffer trung bình.
-   * ma_buf : buffer trung bình trượt.
-   * ma_head: vị trí ghi mới trong ma_buf.
-   * ma_cnt : số mẫu hiện đang có (tăng dần tới BUF_CAP).
-   * ma     : giá trị trung bình hiện tại (nền DC).
-   * =================================================================*/
+  /* ================= Khử DC bằng trung bình trượt 1 giây ========== */
   uint32_t ma_sum = 0;
   uint16_t ma_buf[BUF_CAP]; memset(ma_buf, 0, sizeof(ma_buf));
   uint16_t ma_head = 0, ma_cnt = 0;
 
-  /* Low-pass IIR bậc 1 (sau khử DC): y[n] = 0.85*y[n-1] + 0.15*x[n]
-   * lp: tín hiệu sau lọc, làm mượt nhiễu cao tần.
-   * Dùng kiểu int32_t vì có thể âm/dương (đã khử DC).
-   */
+  /* Low-pass IIR bậc 1: y[n] = 0.85*y[n-1] + 0.15*x[n] */
   int32_t  lp = 0;
 
-  /* ================= Biến tính nhịp tim trong miền thời gian ==========
-   * lastBeatMs : thời điểm (ms) phát hiện nhịp gần nhất.
-   * prevBeatMs : mốc để đo RR = now - prevBeatMs.
-   * rr_buf     : buffer lưu một số khoảng RR để lấy trung bình.
-   * rr_cnt     : số phần tử hợp lệ trong rr_buf.
-   * rr_idx     : chỉ số vòng tròn để ghi RR mới.
-   * bpm_show   : BPM trung bình hiện tại (hiển thị ra UART/plot).
-   * ====================================================================*/
+  /* ================= Biến tính nhịp tim trong miền thời gian ========== */
   uint32_t lastBeatMs = 0, prevBeatMs = 0;
   uint32_t rr_buf[AVG_BPM_WINDOW] = {0};
   uint8_t  rr_cnt = 0, rr_idx = 0;
   uint32_t bpm_show = 0;
 
-  /* ================= Quản lý LED & logging ============================
-   * ledOffAt  : thời điểm tắt LED (millis), 0 nghĩa là LED đang tắt.
-   * lastPrint : dùng để in debug ĐỊNH KỲ (~10 Hz) chứ không phải mỗi mẫu.
-   * ====================================================================*/
+  /* ================= Quản lý LED ============================ */
   uint32_t ledOffAt = 0;
-  uint32_t lastPrint = 0;
 
-  /* ================= State machine phát hiện nhịp =====================
-   * Ta dùng 2 trạng thái:
-   *  - WAIT_RISE: chờ tín hiệu vượt qua ngưỡng cao (th_hi) để bắt đầu đỉnh.
-   *  - WAIT_FALL: sau khi qua th_hi, chờ tín hiệu rơi xuống lại qua th_lo
-   *               để "chốt" đỉnh, tránh nhiễu lặt vặt.
-   * cand_peak  : giá trị đỉnh tạm thời (sig) trong pha WAIT_FALL.
-   * cand_time  : thời điểm đo được đỉnh lớn nhất trong pha WAIT_FALL.
-   * ====================================================================*/
+  /* ================= State machine phát hiện nhịp ===================== */
   typedef enum { WAIT_RISE = 0, WAIT_FALL = 1 } det_state_t;
   det_state_t st = WAIT_RISE;
   int32_t     cand_peak = INT32_MIN;
@@ -214,7 +185,6 @@ int main(void)
       }
 
       /* 5. Cập nhật cửa sổ min/max cho tín hiệu (để tính biên độ p2p) */
-      /*    Để dùng kiểu uint16_t, ta dịch sig lên bằng 2048 (offset) */
       uint16_t sig_u = (uint16_t)(sig + 2048);
 
       if (count < BUF_CAP) count++;
@@ -313,38 +283,33 @@ int main(void)
         HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
         ledOffAt = now + LED_ON_MS;
 
-        /* In thông tin phát hiện nhịp (dùng xem trên Serial Monitor) */
+        /* In thông tin phát hiện nhịp (tuỳ chọn) */
         printf(">>> Phat hien nhip!  BPM:%lu%s\r\n",
                bpm_show,
                (bpm_show > HEART_RATE_WARN_BPM) ? "  (CANH BAO >110)" : "");
       }
 
-      /* 10. In dữ liệu định kỳ ~10 Hz, dạng phù hợp với Serial Plotter
-       *  Format: "tho:... nen:... tin:... Min:... Max:... BPMx20:..."
-       *  - tho   : giá trị ADC thô (0..4095).
-       *  - nen   : giá trị nền (trung bình trượt).
-       *  - tin   : tín hiệu sau khử DC + lọc (sig).
-       *  - Min/Max: giá trị min/max trong cửa sổ 1 s.
-       *  - BPMx20: BPM nhân 20 để sóng nhịp tim nổi rõ hơn trong Plotter.
-       */
-      if (now - lastPrint >= 100u) {
-        lastPrint = now;
-        printf("tho:%lu nen:%u tin:%ld Min:%u Max:%u BPMx20:%lu\r\n",
-               raw, ma, (long)sig, win_min, win_max, bpm_show * 20u);
-      }
-
-      /* 11. Tắt LED đúng thời điểm, không dùng delay blocking */
+      /* 10. Tắt LED đúng thời điểm, không dùng delay blocking */
       if (ledOffAt && now >= ledOffAt) {
         HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
         ledOffAt = 0;
       }
     } /* ====== Kết thúc xử lý 1 batch 50 mẫu ====== */
 
-    /* 12. Nếu đã thu đủ 1024 mẫu cho FFT thì gọi hàm DFT */
+    /* 11. Nếu đã thu đủ 1024 mẫu cho FFT thì gọi hàm DFT */
     if (fft_ready) {
       fft_ready = false;
-      FFT_Compute();   /* In ra: FFT_Peak=... Hz, FFT_BPM=... (Serial Monitor) */
+      FFT_Compute();   /* cập nhật g_fft_peak_freq, g_fft_bpm */
     }
+
+    /* 12. In kết quả TỔNG HỢP 2 lần/giây:
+     *  - Nhịp tim theo miền thời gian (bpm_show)
+     *  - FFT_Peak (Hz) và FFT_BPM (FFT_Peak * 60)
+     */
+    printf("-> BPM:%lu FFT_Peak=%.1f Hz, FFT_BPM=%.1f\r\n",
+           bpm_show,
+           g_fft_peak_freq,
+           g_fft_bpm);
 
     /* 13. Vòng lặp chính nghỉ 500 ms theo đúng yêu cầu đề bài */
     HAL_Delay(LOOP_DT_MS);
@@ -356,8 +321,8 @@ int main(void)
  *  - Sử dụng công thức DFT trực tiếp (không phải FFT tối ưu).
  *  - Tính phần thực/ảo cho k = 0..FFT_N/2 - 1 (nửa phổ, do tín hiệu là thực).
  *  - Tính biên độ phổ |X(k)| = sqrt(Re^2 + Im^2).
- *  - Tìm bin có biên độ lớn nhất (bỏ k=0 để tránh DC).
- *  - Chuyển bin -> tần số -> BPM_FFT, rồi in ra UART.
+ *  - Chỉ tìm đỉnh trong dải 0.7–3 Hz (~42–180 BPM) để loại bỏ dao động rất thấp.
+ *  - Chuyển bin -> tần số -> BPM_FFT, lưu vào g_fft_peak_freq / g_fft_bpm.
  * ==========================================================================*/
 static void FFT_Compute(void)
 {
@@ -378,10 +343,20 @@ static void FFT_Compute(void)
     fft_mag[k] = sqrtf(sumRe * sumRe + sumIm * sumIm);
   }
 
-  /* B2: tìm đỉnh phổ (bỏ k=0 vì đó là thành phần DC) */
-  uint32_t peak_k = 1;
-  float    peak_val = fft_mag[1];
-  for (uint32_t k = 2; k < FFT_N/2; ++k) {
+  /* B2: Chỉ tìm đỉnh trong dải tần có thể là nhịp tim: 0.7–3 Hz */
+  float f_min = 0.7f;   /* Hz  ~ 42 BPM */
+  float f_max = 3.0f;   /* Hz  ~ 180 BPM */
+
+  uint32_t k_min = (uint32_t)(f_min * (float)FFT_N / (float)PROCESS_FS_HZ);
+  uint32_t k_max = (uint32_t)(f_max * (float)FFT_N / (float)PROCESS_FS_HZ);
+
+  if (k_min < 1) k_min = 1;                        /* bỏ DC */
+  if (k_max >= FFT_N/2) k_max = FFT_N/2 - 1;
+
+  uint32_t peak_k  = k_min;
+  float    peak_val = fft_mag[k_min];
+
+  for (uint32_t k = k_min + 1; k <= k_max; ++k) {
     if (fft_mag[k] > peak_val) {
       peak_val = fft_mag[k];
       peak_k   = k;
@@ -393,8 +368,9 @@ static void FFT_Compute(void)
   float peakFreq = df * (float)peak_k;                    /* Hz */
   float bpm_fft  = peakFreq * 60.0f;                      /* BPM */
 
-  /* B4: in ra kết quả FFT dưới dạng text để quan sát trên Serial Monitor */
-  printf("FFT_Peak=%.1f Hz, FFT_BPM=%.1f\r\n", peakFreq, bpm_fft);
+  /* B4: cập nhật biến global để main() in định kỳ */
+  g_fft_peak_freq = peakFreq;
+  g_fft_bpm       = bpm_fft;
 }
 
 /* ================= GPIO: PA5 (LED), PA0 (analog cho ADC1_IN0) =============*/
