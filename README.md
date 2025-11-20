@@ -1,161 +1,238 @@
-Dưới đây là nội dung `README.md` bạn có thể copy dán thẳng vào file trong project rồi push lên GitHub.
+# STM32F401RE – Pulse Sensor Heart Rate Monitor (Time-domain + FFT với CMSIS-DSP)
+
+Dự án này hiện thực đo nhịp tim bằng **Pulse Sensor** trên kit **Nucleo-F401RE**, gồm:
+
+- Đo tín hiệu analog từ cảm biến trên chân **PA0 (ADC1_IN0)**.  
+- Khử DC bằng trung bình trượt ~1 giây.  
+- Lọc thông thấp IIR bậc 1 để làm mượt tín hiệu.  
+- Phát hiện nhịp tim trong **miền thời gian** bằng ngưỡng Schmitt + state machine.  
+- Tính **BPM** từ khoảng cách giữa các đỉnh RR (Beat-to-Beat).  
+- Thu 1024 mẫu đã xử lý và tính **FFT** bằng thư viện **CMSIS-DSP (`arm_math.h`)** để tìm đỉnh phổ và suy ra **BPM_FFT**.  
+- Gửi kết quả qua UART (USART2) để xem trên **Serial Monitor** và nháy **LED PA5** mỗi khi phát hiện 1 nhịp tim hợp lệ.
 
 ---
 
-````markdown
-# STM32 DSP Heart-Rate Monitor (Nucleo-F401RE + Pulse Sensor)
+## 1. Phần cứng
 
-DSP project on **STM32F401RE Nucleo** for heart-rate acquisition and analysis using a Pulse Sensor.  
-The firmware performs **ADC sampling, DC removal, low-pass filtering, adaptive peak detection, BPM calculation, and DFT-based frequency analysis (manual FFT)**.  
-Results are printed over **USART2 @ 115200 baud** and can be viewed in the Arduino Serial Monitor / any terminal.
+- **MCU**: STM32F401RE (Nucleo-F401RE board).  
+- **Cảm biến nhịp tim**: Pulse Sensor (hoặc cảm biến tương tự xuất tín hiệu analog).  
+- **Kết nối chính**:
+  - Pulse Sensor **OUT → PA0** (ADC1_IN0).  
+  - GND cảm biến → GND board.  
+  - VCC cảm biến (3.3V hoặc 5V tùy loại, khuyến nghị 3.3V nếu tín hiệu đưa trực tiếp vào ADC).  
+  - **LED on-board**: PA5 (LD2) – đã có sẵn trên kit Nucleo.  
+  - **UART2**:
+    - PA2: TX (Nucleo → PC / USB-UART on-board).  
+    - PA3: RX (không dùng trong project này, nhưng vẫn cấu hình sẵn).  
 
----
-
-## 1. Hardware
-
-- Board: **STM32F401RE Nucleo**
-- Sensor: **Pulse Sensor** (analog output)
-- Connections:
-  - Pulse Sensor signal → **PA0** (ADC1_IN0)
-  - On-board LED LD2 → **PA5** (heart-beat blink)
-  - USART2:
-    - **PA2** – TX (connect to USB-UART if needed, on Nucleo already wired to ST-Link)
-    - **PA3** – RX (unused in this demo)
-
-Power the Nucleo through the USB ST-Link connector.
+Trên Nucleo-F401RE, UART2 đã nối sẵn với cổng USB ST-LINK, chỉ cần cắm cáp USB và mở Serial Monitor trên PC.
 
 ---
 
-## 2. Main Features
+## 2. Phần mềm & Thư viện
 
-1. **Continuous ADC sampling**
-   - ADC1 reads PA0 in continuous mode (12-bit, 0…4095).
-
-2. **DC removal (baseline wander removal)**
-   - A 1-second **moving average** is computed on the raw ADC signal.
-   - DC-free signal:  
-     \[
-     x_{\text{dc}}[n] = \text{raw}[n] - \text{mean}_{1\,\text{s}}[n]
-     \]
-
-3. **Low-pass IIR filter (smoothing)**
-   - First-order IIR used as a simple low-pass filter:
-     \[
-     y[n] = 0.85 \cdot y[n-1] + 0.15 \cdot x_{\text{dc}}[n]
-     \]
-   - This reduces high-frequency noise and makes the peaks cleaner.
-
-4. **Adaptive peak detection + Schmitt trigger**
-   - A sliding **1-second window** keeps track of `min` and `max` of the filtered signal.
-   - Peak-to-peak amplitude `pk2pk = max - min` is used to define dynamic thresholds:
-     - High threshold:  `th_hi = min + 65% * pk2pk`
-     - Low threshold:   `th_lo = min + 45% * pk2pk`
-   - A two-state **state machine** is used:
-     - `WAIT_RISE`: wait for signal to cross `th_hi` with enough amplitude.
-     - `WAIT_FALL`: track the local maximum, then wait until signal falls below `th_lo` to **confirm a beat**.
-   - A **refractory period** `REFRACTORY_MS = 330 ms` prevents double-counting.
-   - Minimum peak-to-peak (`MIN_PEAK_TO_PEAK = 40`) filters out noise bursts.
-
-5. **Time-domain BPM calculation**
-   - For each accepted beat, the **RR interval** (ms) between consecutive beats is measured.
-   - Only RR in the range `[350 ms, 2000 ms]` (≈ 30–171 BPM) is considered valid.
-   - An average over the last 4 RR values is used:
-     \[
-     \text{BPM}_{\text{time}} = \frac{60000}{\text{mean\_RR}}
-     \]
-
-6. **DFT / “FFT”-based frequency analysis**
-   - Filtered signal `sig` is stored into a buffer of **1024 samples** (`FFT_N = 1024`) at a logical sampling rate of **100 Hz**.
-   - When the buffer is full, a **manual DFT** is computed for bins `k = 0…FFT_N/2 - 1` (real-signal half-spectrum).
-   - Magnitude:
-     \[
-     |X(k)| = \sqrt{ \text{Re}^2 + \text{Im}^2 }
-     \]
-   - The spectral peak is searched **only in 0.7–3 Hz** (≈ 42–180 BPM) to reject slow drift and very high noise.
-   - Frequency resolution:
-     \[
-     \Delta f = \frac{F_s}{N} = \frac{100}{1024} \approx 0.098 \text{ Hz}
-     \]
-   - FFT-based BPM:
-     \[
-     \text{BPM}_{\text{FFT}} = f_{\text{peak}} \times 60
-     \]
-
-7. **LED beat indicator**
-   - Each accepted beat turns **LED PA5** ON for `LED_ON_MS = 30 ms`, giving a visible blink for every heart beat.
-
-8. **No-pulse watchdog**
-   - If no beat is detected for more than **2 seconds**, `BPM` is reset to 0.
+- **IDE đề nghị**:
+  - STM32CubeIDE (hoặc bất kỳ toolchain ARM GCC tương thích).
+- **Thư viện**:
+  - HAL của STM32F4 (đã dùng trong `main.c`).
+  - **CMSIS-DSP (`arm_math.h`)**:
+    - Cần đảm bảo đã:
+      - Thêm đường dẫn include tới **CMSIS/Core** và **CMSIS/DSP**.
+      - Link đúng file thư viện hoặc file nguồn DSP (ví dụ: `arm_rfft_fast_f32.c`, `arm_cmplx_mag_f32.c`, … hoặc static lib tương ứng cho Cortex-M4F).
 
 ---
 
-## 3. UART Output Format
+## 3. Tham số quan trọng trong code
 
-Baud rate: **115200**, 8-N-1, on **USART2** (PA2 TX).  
+```c
+#define PROCESS_FS_HZ      100u     // Tần số xử lý & lấy mẫu logic: ~100 Hz
+#define LOOP_DT_MS         500u     // Vòng lặp chính: 500 ms (2 Hz)
+#define FFT_N              1024u    // Số điểm FFT
+Mỗi 500 ms, vòng while(1) xử lý 50 mẫu (100 Hz × 0.5 s).
 
-The firmware prints 2 loại dòng chính:
+Sau khi thu đủ 1024 mẫu đã xử lý → gọi FFT_Compute().
 
-1. **Beat event (tùy chọn – có thể tắt trong code)**
+Các ngưỡng/giới hạn dùng cho thuật toán phát hiện nhịp tim:
 
-   ```text
-   >>> Phat hien nhip!  BPM:75
-   >>> Phat hien nhip!  BPM:122  (CANH BAO >110)
-````
+c
+Sao chép mã
+#define LED_ON_MS                 30u
+#define REFRACTORY_MS            330u
+#define AVG_BPM_WINDOW             4u
+#define WIN_MS                  1000u
 
-* In ra mỗi khi phát hiện một nhịp mới.
-* Nếu `BPM > 110`, thêm chuỗi cảnh báo.
+#define HEART_RATE_WARN_BPM      110u
+#define TH_HI_PCT                 65u
+#define TH_LO_PCT                 45u
+#define MIN_PEAK_TO_PEAK          40u
+#define RR_MIN_MS                350u   // ~171 BPM
+#define RR_MAX_MS               2000u   // ~30 BPM
+#define NO_PULSE_TIMEOUT_MS     2000u
+Bạn có thể tinh chỉnh các giá trị này nếu muốn thuật toán nhạy hơn / bớt nhạy, hoặc ưu tiên bỏ nhiễu mạnh hơn.
 
-2. **Tổng hợp định kỳ 2 lần/giây (mỗi vòng lặp 500 ms)**
+4. Luồng xử lý tín hiệu
+4.1. Lấy mẫu & Tiền xử lý
+Trong vòng lặp:
 
-   ```text
-   -> BPM:75 FFT_Peak=1.3 Hz, FFT_BPM=78.0
-   ```
+Đọc ADC từ PA0 (ADC1 hoạt động chế độ liên tục):
 
-   * `BPM`      : giá trị BPM trung bình trong miền thời gian.
-   * `FFT_Peak` : tần số đỉnh phổ (Hz) trong dải 0.7–3 Hz.
-   * `FFT_BPM`  : BPM suy ra từ đỉnh phổ.
 
-Bạn có thể mở **Arduino Serial Monitor** hoặc bất kỳ terminal nào, chọn `115200 baud` để quan sát kết quả.
 
----
+HAL_ADC_PollForConversion(&hadc1, 1);
+raw = HAL_ADC_GetValue(&hadc1);  // 0..4095 (12-bit)
+Khử DC bằng trung bình trượt ~1 giây:
 
-## 4. Algorithm Summary (Vietnamese)
+Lưu các mẫu raw vào buffer ma_buf.
 
-Chương trình lấy mẫu tín hiệu nhịp tim từ cảm biến Pulse Sensor qua ADC1 kênh PA0 ở tần số logic 100 Hz. Tín hiệu thô trước tiên được khử thành phần DC bằng trung bình trượt trong 1 giây, sau đó đi qua bộ lọc thông thấp IIR bậc 1 (hệ số 0.85/0.15) để làm mượt. Trên tín hiệu đã lọc, chương trình duy trì một cửa sổ 1 giây để ước lượng giá trị nhỏ nhất và lớn nhất, từ đó tính biên độ peak-to-peak và sinh ra cặp ngưỡng Schmitt cao / thấp. Một state machine hai trạng thái (WAIT_RISE, WAIT_FALL) dùng các ngưỡng này để phát hiện đỉnh nhịp tim, kết hợp với thời gian trơ nhằm tránh đếm đôi. Mỗi khi một nhịp hợp lệ được chốt, khoảng RR giữa hai nhịp liên tiếp được cập nhật vào bộ đệm và dùng để tính BPM trung bình. Song song, 1024 mẫu tín hiệu đã lọc được lưu lại để thực hiện DFT thủ công, tìm đỉnh phổ trong dải tần tương ứng với nhịp tim sinh lý. Cuối cùng, chương trình in ra cả BPM theo miền thời gian và BPM theo miền tần số, đồng thời nháy LED PA5 mỗi khi phát hiện nhịp mới.
+Tính tổng ma_sum, chia cho số mẫu hiện có -> ma (nền DC).
 
----
+Tín hiệu đã khử DC:
 
-## 5. Build & Run
 
-1. Open the project in **STM32CubeIDE** (or your preferred IDE using HAL drivers).
-2. Select board / MCU: **STM32F401RE**.
-3. Ensure clock tree is configured to **84 MHz** system clock (HSI + PLL as in `SystemClock_Config()`).
-4. Build and flash the firmware to the Nucleo board.
-5. Open a serial terminal at **115200 baud** on the Nucleo’s virtual COM port.
-6. Place the Pulse Sensor firmly on a fingertip and observe:
 
-   * LED LD2 blinking at each heartbeat.
-   * BPM and FFT information streaming over UART.
+x_dc = raw - ma;
+Lọc thông thấp IIR bậc 1 để làm mượt:
 
----
 
-## 6. File Overview
+// y[n] = 0.85 * y[n-1] + 0.15 * x[n]
+lp = (85 * lp + 15 * x_dc) / 100;
+sig = lp;
+Đưa dữ liệu vào buffer FFT:
 
-* `Core/Src/main.c` – main application: acquisition, filtering, peak detection, BPM, DFT.
-* `Core/Src/system_stm32f4xx.c`, `startup_stm32f401retx.s` – system and startup files generated by STM32CubeIDE.
-* `Drivers/*` – HAL and CMSIS libraries.
+Chuẩn hóa tương đối về khoảng [-1, 1] rồi lưu:
 
----
 
-## 7. License
+fft_input[fft_index++] = (float32_t)sig / 2048.0f;
+Khi fft_index đạt 1024 → fft_ready = true.
 
-This project is released under the **MIT License**.
-See the `LICENSE` file for details.
+Cửa sổ trượt min/max 1 s:
 
-```
+Dùng buffer vòng buf[] để lưu sig_u = sig + 2048.
 
----
+Cập nhật win_min, win_max → biên độ peak-to-peak:
 
-Nếu bạn muốn mình viết thêm bản README tiếng Việt 100% (không song ngữ) hoặc thêm hình minh họa / sơ đồ kết nối để chèn vào GitHub thì nói mình bổ sung tiếp nhé.
-::contentReference[oaicite:0]{index=0}
-```
+
+pk2pk = win_max - win_min;
+Tính ngưỡng Schmitt động theo p2p:
+
+
+th_hi = win_min + pk2pk * TH_HI_PCT / 100;
+th_lo = win_min + pk2pk * TH_LO_PCT / 100;
+4.2. Thuật toán phát hiện nhịp trong miền thời gian
+Sử dụng state machine 2 trạng thái:
+
+WAIT_RISE – chờ tín hiệu vượt ngưỡng cao th_hi với biên độ đủ lớn (pk2pk >= MIN_PEAK_TO_PEAK).
+
+WAIT_FALL – sau khi qua th_hi, theo dõi đỉnh, đến khi tín hiệu rơi xuống dưới th_lo thì chốt đỉnh.
+
+Mỗi khi phát hiện 1 đỉnh hợp lệ:
+
+Tính khoảng RR = now - prevBeatMs.
+
+Chỉ chấp nhận nếu RR nằm trong [RR_MIN_MS, RR_MAX_MS].
+
+Lưu RR vào rr_buf[], tính RR trung bình và suy ra:
+
+
+bpm_show = 60000 / rr_avg;
+Bật LED PA5 trong LED_ON_MS ms:
+
+
+HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+ledOffAt = now + LED_ON_MS;
+In ra UART thông tin phát hiện nhịp:
+
+
+>>> Phat hien nhip!  BPM:xx (CANH BAO >110)
+4.3. FFT với CMSIS-DSP (arm_math.h)
+Khi fft_ready == true, hàm FFT_Compute() được gọi:
+
+FFT thực một chiều:
+
+
+arm_rfft_fast_f32(&fft_instance, fft_input, fft_output, 0);
+Tính biên độ phổ:
+
+
+arm_cmplx_mag_f32(fft_output, fft_mag, FFT_N/2);
+Chỉ tìm đỉnh trong dải tần nhịp tim có ý nghĩa:
+
+Dải: 0.7 – 3 Hz (~42 – 180 BPM).
+
+Đổi dải tần sang dải chỉ số bin [k_min, k_max].
+
+Dùng arm_max_f32() để tìm bin có biên độ lớn nhất:
+
+
+arm_max_f32(&fft_mag[k_min], (k_max - k_min + 1), &maxVal, &maxIdxRel);
+peak_k = k_min + maxIdxRel;
+Đổi bin ra tần số:
+
+
+df       = SAMPLE_RATE_HZ / FFT_N;   // Độ phân giải tần số
+peakFreq = df * peak_k;              // Hz
+bpm_fft  = peakFreq * 60.0f;         // BPM
+Lưu vào biến global:
+
+
+g_fft_peak_freq = peakFreq;
+g_fft_bpm       = bpm_fft;
+Trong main(), cứ mỗi 500 ms, chương trình in dòng tổng hợp:
+
+
+-> BPM:xx FFT_Peak=yy.y Hz, FFT_BPM=zz.z
+5. UART & Serial Monitor
+UART dùng USART2, cấu hình:
+
+Baud rate: 115200
+
+8 data bits, không parity, 1 stop bit (8N1).
+
+Dữ liệu in ra dạng text, ví dụ:
+
+
+>>> Phat hien nhip!  BPM:75
+-> BPM:75 FFT_Peak=1.3 Hz, FFT_BPM=78.0
+Có thể dùng:
+
+Arduino Serial Monitor.
+
+Serial Monitor của STM32CubeIDE.
+
+PuTTY / TeraTerm / RealTerm, v.v.
+
+6. Cách build & nạp chương trình
+Tạo project STM32F401RE trong STM32CubeIDE (hoặc dùng project có sẵn).
+
+Thêm file main.c này vào project, đảm bảo bật:
+
+ADC1 trên PA0.
+
+USART2 trên PA2/PA3.
+
+Thêm CMSIS-DSP:
+
+Include arm_math.h.
+
+Thêm đường dẫn CMSIS/Include và CMSIS/DSP/Include vào include path.
+
+Link các file nguồn/binary của CMSIS-DSP cho Cortex-M4F (có FPU).
+
+Build project, nạp xuống Nucleo-F401RE qua ST-LINK.
+
+Mở Serial Monitor ở 115200 baud, reset board và đặt ngón tay lên Pulse Sensor để quan sát giá trị BPM & FFT_BPM.
+
+7. Ghi chú & Tinh chỉnh
+Nếu tín hiệu quá nhiễu / không lên nhịp:
+
+Kiểm tra mass chung, dây nối, nguồn cảm biến.
+
+Giảm MIN_PEAK_TO_PEAK nếu tín hiệu yếu.
+
+Điều chỉnh TH_HI_PCT, TH_LO_PCT để ngưỡng Schmitt phù hợp hơn.
+
+Nếu FFT_BPM lệch nhiều so với BPM thời gian:
+
+Đảm bảo bạn giữ tay ổn định đủ lâu để đủ 1024 mẫu ổn định.
+
+Có thể thu hẹp hoặc dịch dải f_min, f_max để loại nhiễu tần số khác.

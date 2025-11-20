@@ -5,7 +5,8 @@
  *  - Lọc thông thấp IIR bậc 1 để làm mượt tín hiệu.
  *  - Phát hiện đỉnh (peak) bằng ngưỡng Schmitt động + state machine.
  *  - Từ khoảng RR (Beat-to-Beat) -> tính BPM trong miền thời gian.
- *  - Thu thập 1024 mẫu đã xử lý để tính DFT (FFT thủ công) -> tìm đỉnh phổ.
+ *  - Thu thập 1024 mẫu đã xử lý để tính FFT bằng CMSIS-DSP (arm_math.h).
+ *  - Tìm đỉnh phổ trong dải nhịp tim và đổi sang BPM_FFT.
  *  - In dữ liệu dạng text để hiển thị trên Serial Monitor.
  *  - LED PA5 nháy mỗi khi phát hiện một nhịp tim hợp lệ.
  *
@@ -15,11 +16,11 @@
 #include "main.h"
 #include "stm32f4xx_hal_adc.h"
 #include "stm32f4xx_hal_uart.h"
+#include "arm_math.h"   /* dùng CMSIS-DSP: arm_rfft_fast, arm_cmplx_mag, arm_max */
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
 #include <limits.h>
-#include <math.h>   /* dùng cosf, sinf, sqrtf cho DFT thủ công */
 
 /* -------------------- Handles phần cứng -------------------- */
 ADC_HandleTypeDef  hadc1;   /* handle cho ADC1 */
@@ -38,7 +39,7 @@ void Error_Handler(void);
  * SAMPLES_PER_BATCH: số mẫu xử lý mỗi vòng (PROCESS_FS_HZ * 0.5 s = 50).
  * ==========================================================================*/
 #define LOOP_DT_MS               500u     /* vòng lặp chính ~2 Hz (mỗi 500 ms) */
-#define PROCESS_FS_HZ            100u     /* "Fs logic" cho thuật toán: 100 Hz  */
+#define PROCESS_FS_HZ            100u     /* "Fs logic" cho thuật toán & FFT    */
 #define SAMPLES_PER_BATCH  ((PROCESS_FS_HZ * LOOP_DT_MS) / 1000u) /* = 50 mẫu */
 
 /* ======================== Tham số thuật toán phát hiện nhịp ================
@@ -65,34 +66,34 @@ void Error_Handler(void);
 #define RR_MAX_MS               2000u     /* RR lớn hơn -> quá chậm, bỏ (≈30 BPM) */
 #define NO_PULSE_TIMEOUT_MS     2000u     /* 2 s không có nhịp -> xem như không đo */
 
-/* ======================== PHẦN 4: DFT/FFT =========================
- * Không dùng arm_math.h, ta tự cài đặt DFT 1 phía (0..Fs/2).
- * - FFT_N: số điểm DFT (1024 mẫu).
- * - fft_in : buffer lưu tín hiệu thời gian đã xử lý (sig).
- * - fft_re, fft_im, fft_mag: phần thực, ảo, và biên độ phổ cho từng bin.
- * - fft_index: vị trí hiện tại trong buffer.
- * - fft_ready: cờ báo đã đủ 1024 mẫu, sẵn sàng tính DFT.
- * ==================================================================*/
-#ifndef M_PI
-#define M_PI 3.14159265358979323846f
-#endif
+/* ======================== PHẦN FFT bằng CMSIS-DSP ==========================
+ * - FFT_N: số điểm FFT (1024 mẫu).
+ * - fft_input : buffer lưu tín hiệu thời gian (sig) dạng float.
+ * - fft_output: buffer phức sau RFFT (chiều dài N).
+ * - fft_mag   : biên độ phổ cho từng bin (0..N/2-1).
+ * - fft_index : vị trí hiện tại trong buffer.
+ * - fft_ready : cờ báo đã đủ 1024 mẫu, sẵn sàng tính FFT.
+ * - g_fft_peak_freq / g_fft_bpm: kết quả đỉnh phổ & BPM_FFT in ở main().
+ * ==========================================================================*/
+#define FFT_N           1024u
+#define SAMPLE_RATE_HZ  PROCESS_FS_HZ   /* 100 Hz */
 
-#define FFT_N 1024u   /* số điểm DFT – như trong tài liệu hướng dẫn */
+static float32_t fft_input[FFT_N];
+static float32_t fft_output[FFT_N];
+static float32_t fft_mag[FFT_N/2];
+static uint32_t  fft_index = 0;
+static bool      fft_ready = false;
 
-static float fft_in[FFT_N];      /* mẫu tín hiệu thời gian sau xử lý */
-static float fft_re[FFT_N/2];    /* phần thực phổ cho k = 0..FFT_N/2-1 */
-static float fft_im[FFT_N/2];    /* phần ảo phổ */
-static float fft_mag[FFT_N/2];   /* biên độ phổ |X(k)| */
-static uint32_t fft_index = 0;   /* con trỏ ghi mẫu vào fft_in */
-static bool     fft_ready = false; /* true khi đủ 1024 mẫu để tính DFT */
+/* Instance FFT của CMSIS-DSP */
+static arm_rfft_fast_instance_f32 fft_instance;
 
 /* GIÁ TRỊ FFT DÙNG ĐỂ IN ĐỊNH KỲ (2 lần/giây) */
-static float g_fft_peak_freq = 0.0f;  /* Hz */
-static float g_fft_bpm       = 0.0f;  /* BPM từ FFT */
+static float32_t g_fft_peak_freq = 0.0f;  /* Hz */
+static float32_t g_fft_bpm       = 0.0f;  /* BPM từ FFT */
 
-static void FFT_Compute(void);   /* prototype hàm tính DFT và cập nhật kết quả */
+static void FFT_Compute(void);   /* prototype hàm tính FFT và cập nhật kết quả */
 
-/* --------- Redirect printf về UART2 (dùng cho debug + Serial Plotter) ----- */
+/* --------- Redirect printf về UART2 (dùng cho debug + Serial Monitor) ----- */
 int __io_putchar(int ch) {
   uint8_t c = (uint8_t)ch;
   HAL_UART_Transmit(&huart2, &c, 1, HAL_MAX_DELAY);
@@ -108,6 +109,11 @@ int main(void)
   MX_GPIO_Init();          /* Khởi tạo GPIO: PA5 (LED), PA0 (analog) */
   MX_ADC1_Init();          /* Khởi tạo ADC1 đọc kênh PA0 */
   MX_USART2_UART_Init();   /* Khởi tạo UART2 để in dữ liệu */
+
+  /* Khởi tạo FFT CMSIS-DSP */
+  if (arm_rfft_fast_init_f32(&fft_instance, FFT_N) != ARM_MATH_SUCCESS) {
+    printf("FFT init error\r\n");
+  }
 
   /* Tắt buffer chuẩn của printf để in ra ngay (không bị dồn) */
   setvbuf(stdout, NULL, _IONBF, 0);
@@ -175,13 +181,13 @@ int main(void)
 
       /* 3. Lọc thông thấp IIR bậc 1 để làm mượt (giảm nhiễu cao tần) */
       lp = ( (85 * lp) + (15 * x_dc) ) / 100;
-      int32_t sig = lp;                           /* tín hiệu đã xử lý dùng cho detect */
+      int32_t sig = lp;                           /* tín hiệu đã xử lý dùng cho detect & FFT */
 
-      /* 4. Lưu tín hiệu đã xử lý vào buffer FFT (để phân tích phổ sau này) */
-      fft_in[fft_index++] = (float)sig;
+      /* 4. Lưu tín hiệu đã xử lý vào buffer FFT (chuẩn hoá về [-1,1] tương đối) */
+      fft_input[fft_index++] = (float32_t)sig / 2048.0f;
       if (fft_index >= FFT_N) {
         fft_index = 0;        /* quay lại đầu buffer */
-        fft_ready = true;     /* báo đã đủ 1024 mẫu để tính DFT */
+        fft_ready = true;     /* báo đã đủ 1024 mẫu để tính FFT */
       }
 
       /* 5. Cập nhật cửa sổ min/max cho tín hiệu (để tính biên độ p2p) */
@@ -227,9 +233,9 @@ int main(void)
         prevBeatMs = 0;
       }
 
-      /* 8. State machine phát hiện nhịp tim */
-      bool accepted = false;      /* cờ báo vừa phát hiện một nhịp hợp lệ */
-      uint16_t sig_w = sig_u;     /* dùng phiên bản dương (offset) cho so sánh ngưỡng */
+      /* 8. State machine phát hiện nhịp tim (giữ nguyên như code cũ) */
+      bool     accepted = false;      /* cờ báo vừa phát hiện một nhịp hợp lệ */
+      uint16_t sig_w    = sig_u;      /* dùng phiên bản dương (offset) cho so sánh ngưỡng */
 
       switch (st) {
         case WAIT_RISE:
@@ -296,7 +302,7 @@ int main(void)
       }
     } /* ====== Kết thúc xử lý 1 batch 50 mẫu ====== */
 
-    /* 11. Nếu đã thu đủ 1024 mẫu cho FFT thì gọi hàm DFT */
+    /* 11. Nếu đã thu đủ 1024 mẫu cho FFT thì gọi hàm FFT (CMSIS-DSP) */
     if (fft_ready) {
       fft_ready = false;
       FFT_Compute();   /* cập nhật g_fft_peak_freq, g_fft_bpm */
@@ -316,59 +322,38 @@ int main(void)
   }
 }
 
-/* ================== Hàm tính DFT/FFT (PHẦN 4) =============================
- * Hàm FFT_Compute():
- *  - Sử dụng công thức DFT trực tiếp (không phải FFT tối ưu).
- *  - Tính phần thực/ảo cho k = 0..FFT_N/2 - 1 (nửa phổ, do tín hiệu là thực).
- *  - Tính biên độ phổ |X(k)| = sqrt(Re^2 + Im^2).
- *  - Chỉ tìm đỉnh trong dải 0.7–3 Hz (~42–180 BPM) để loại bỏ dao động rất thấp.
- *  - Chuyển bin -> tần số -> BPM_FFT, lưu vào g_fft_peak_freq / g_fft_bpm.
- * ==========================================================================*/
+/* ================== Hàm tính FFT bằng CMSIS-DSP (PHẦN FFT) ================*/
 static void FFT_Compute(void)
 {
-  /* B1: tính DFT cho từng bin k (0..FFT_N/2-1) */
-  for (uint32_t k = 0; k < FFT_N/2; ++k) {
-    float sumRe = 0.0f;
-    float sumIm = 0.0f;
-    for (uint32_t n = 0; n < FFT_N; ++n) {
-      float angle = 2.0f * M_PI * (float)k * (float)n / (float)FFT_N;
-      float c = cosf(angle);
-      float s = sinf(angle);
-      float x = fft_in[n];
-      sumRe += x * c;
-      sumIm -= x * s;  /* e^{-jωn} = cos - j sin */
-    }
-    fft_re[k]  = sumRe;
-    fft_im[k]  = sumIm;
-    fft_mag[k] = sqrtf(sumRe * sumRe + sumIm * sumIm);
-  }
+  /* 1. RFFT nhanh (real FFT): fft_input -> fft_output */
+  arm_rfft_fast_f32(&fft_instance, fft_input, fft_output, 0);
 
-  /* B2: Chỉ tìm đỉnh trong dải tần có thể là nhịp tim: 0.7–3 Hz */
-  float f_min = 0.7f;   /* Hz  ~ 42 BPM */
-  float f_max = 3.0f;   /* Hz  ~ 180 BPM */
+  /* 2. Tính biên độ |X(k)| cho k = 0..FFT_N/2-1 */
+  arm_cmplx_mag_f32(fft_output, fft_mag, FFT_N/2);
 
-  uint32_t k_min = (uint32_t)(f_min * (float)FFT_N / (float)PROCESS_FS_HZ);
-  uint32_t k_max = (uint32_t)(f_max * (float)FFT_N / (float)PROCESS_FS_HZ);
+  /* 3. Chỉ tìm đỉnh trong dải tần có thể là nhịp tim: 0.7–3 Hz */
+  float32_t f_min = 0.7f;   /* Hz  ~ 42 BPM */
+  float32_t f_max = 3.0f;   /* Hz  ~ 180 BPM */
+
+  uint32_t k_min = (uint32_t)(f_min * (float32_t)FFT_N / (float32_t)SAMPLE_RATE_HZ);
+  uint32_t k_max = (uint32_t)(f_max * (float32_t)FFT_N / (float32_t)SAMPLE_RATE_HZ);
 
   if (k_min < 1) k_min = 1;                        /* bỏ DC */
   if (k_max >= FFT_N/2) k_max = FFT_N/2 - 1;
 
-  uint32_t peak_k  = k_min;
-  float    peak_val = fft_mag[k_min];
+  float32_t maxVal;
+  uint32_t  maxIdxRel;
 
-  for (uint32_t k = k_min + 1; k <= k_max; ++k) {
-    if (fft_mag[k] > peak_val) {
-      peak_val = fft_mag[k];
-      peak_k   = k;
-    }
-  }
+  /* arm_max_f32 trên đoạn [k_min..k_max] */
+  arm_max_f32(&fft_mag[k_min], (k_max - k_min + 1), &maxVal, &maxIdxRel);
+  uint32_t peak_k = k_min + maxIdxRel;
 
-  /* B3: từ chỉ số peak_k -> tần số đỉnh (Hz) -> BPM_FFT */
-  float df       = (float)PROCESS_FS_HZ / (float)FFT_N;   /* độ phân giải tần số */
-  float peakFreq = df * (float)peak_k;                    /* Hz */
-  float bpm_fft  = peakFreq * 60.0f;                      /* BPM */
+  /* 4. từ chỉ số peak_k -> tần số đỉnh (Hz) -> BPM_FFT */
+  float32_t df       = (float32_t)SAMPLE_RATE_HZ / (float32_t)FFT_N;   /* độ phân giải tần số */
+  float32_t peakFreq = df * (float32_t)peak_k;                         /* Hz */
+  float32_t bpm_fft  = peakFreq * 60.0f;                               /* BPM */
 
-  /* B4: cập nhật biến global để main() in định kỳ */
+  /* 5. cập nhật biến global để main() in định kỳ */
   g_fft_peak_freq = peakFreq;
   g_fft_bpm       = bpm_fft;
 }
